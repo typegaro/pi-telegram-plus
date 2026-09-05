@@ -141,7 +141,7 @@ async function setLanguage(args: string, ctx: { ui: Ui }, deps: VoiceCommandDeps
 
 async function selectModel(args: string, ctx: { ui: Ui }, deps: VoiceCommandDeps): Promise<void> {
   const [kind, id] = args.trim().toLowerCase().split(/\s+/, 2);
-  const config = deps.getConfig();
+  let config = deps.getConfig();
   // The selector is also the installer: it shows quality/size and provisions
   // the required allow-listed runtime/model when the selected entry is absent.
   if (!kind) {
@@ -175,7 +175,9 @@ async function selectModel(args: string, ctx: { ui: Ui }, deps: VoiceCommandDeps
   if (kind === "stt") {
     const model = KNOWN_STT_MODELS.find((item) => item.id === id);
     if (!model) { ctx.ui.notify("Usage: /tg-voice-model stt small|large-v3-turbo|whisper-cpp-small", "error"); return; }
-    if (!existsSync(expandHome(model.path))) { ctx.ui.notify(`That model is not installed. Expected:\n${model.path}\n\nInstall it manually, then run this command again.`, "error"); return; }
+    if (!existsSync(expandHome(model.path))) { await installModel(`stt ${model.id}`, ctx, deps); return; }
+    await ensureRuntimeForChoice({ kind: "stt", id: model.id, label: model.label, quality: model.quality, install: model.install }, ctx, deps);
+    config = deps.getConfig();
     const stt = model.backend === "faster-whisper"
       ? { ...config.voice?.stt, backend: "faster-whisper" as const, model: model.model, modelPath: model.path, python: configuredPython(config), device: config.voice?.stt?.device ?? "cpu", computeType: config.voice?.stt?.computeType ?? "int8" }
       : { ...config.voice?.stt, backend: "whisper-cpp" as const, model: model.path, binary: config.voice?.stt?.binary ?? "whisper-cli" };
@@ -185,7 +187,9 @@ async function selectModel(args: string, ctx: { ui: Ui }, deps: VoiceCommandDeps
   if (kind === "tts") {
     const model = KNOWN_TTS_MODELS.find((item) => item.id.toLowerCase() === id);
     if (!model) { ctx.ui.notify("Usage: /tg-voice-model tts en_US-lessac-medium|en_US-lessac-high|kokoro-af-heart", "error"); return; }
-    if (!existsSync(expandHome(model.path))) { ctx.ui.notify(`That voice is not installed. Expected:\n${model.path}\n\nUse /tg-voice-install, then run this command again.`, "error"); return; }
+    if (!existsSync(expandHome(model.path))) { await installModel(`tts ${model.id}`, ctx, deps); return; }
+    await ensureRuntimeForChoice({ kind: "tts", id: model.id, label: model.label, quality: model.quality, install: model.install }, ctx, deps);
+    config = deps.getConfig();
     const tts = model.backend === "kokoro"
       ? { ...config.voice?.tts, backend: "kokoro" as const, python: config.voice?.tts?.python ?? config.voice?.stt?.python ?? "python3", model: model.path, config: model.config, voice: model.voice, device: config.voice?.tts?.device ?? "cpu", language: model.language ?? "a" }
       : { ...config.voice?.tts, backend: "piper" as const, binary: configuredPiperBinary(config), model: model.path, config: existsSync(expandHome(model.config)) ? model.config : undefined };
