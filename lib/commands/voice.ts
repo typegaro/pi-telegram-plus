@@ -286,6 +286,26 @@ async function findKokoroPython(): Promise<string> {
   }
 }
 
+async function ensureVenvPip(python: string, venv: string): Promise<void> {
+  try {
+    await runProcess(python, ["-m", "pip", "--version"], 30_000);
+    return;
+  } catch {
+    // A previous `venv` attempt can leave bin/python behind without pip,
+    // especially on Debian/Ubuntu when the python3-venv package is missing.
+    try {
+      await runProcess(python, ["-m", "ensurepip", "--upgrade"], 120_000);
+      await runProcess(python, ["-m", "pip", "--version"], 30_000);
+      return;
+    } catch {
+      const packageHint = process.platform === "linux"
+        ? "Install the OS venv package (Debian/Ubuntu: sudo apt-get install python3-venv),"
+        : "Install a Python distribution that includes ensurepip,";
+      throw new Error(`${packageHint} remove the incomplete environment at ${venv}, then retry the voice installation.`);
+    }
+  }
+}
+
 async function installRuntime(args: string, ctx: { ui: Ui }, deps: VoiceCommandDeps, options: { skipConfirmation?: boolean; throwOnFailure?: boolean } = {}): Promise<boolean> {
   const runtime = args.trim().toLowerCase() || "base";
   if (runtime !== "base" && runtime !== "kokoro") {
@@ -317,6 +337,7 @@ async function installRuntime(args: string, ctx: { ui: Ui }, deps: VoiceCommandD
       ctx.ui.notify(`Creating isolated local Python voice environment (${runtime === "kokoro" ? "Python 3.8–3.12" : "system Python"})…`, "info");
       await runProcess(seedPython, ["-m", "venv", venv], 120_000);
     }
+    await ensureVenvPip(python, venv);
     await runProcess(python, ["-m", "pip", "install", "--upgrade", "pip"], 300_000);
     const config = deps.getConfig();
     if (runtime === "kokoro") {
