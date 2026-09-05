@@ -55,6 +55,10 @@ function inferMimeTypeFromPath(path: string): string | undefined {
     case ".html":
     case ".htm":
       return "text/html";
+    case ".ogg":
+      return "audio/ogg";
+    case ".wav":
+      return "audio/wav";
     default:
       return undefined;
   }
@@ -416,6 +420,35 @@ export function createTelegramTransport(
             if ((fetchError as any)?.name === "AbortError") throw fetchError;
             throw new Error(`Telegram sendPhoto failed: ${fetchError instanceof Error ? fetchError.message : String(fetchError)}`);
           }
+        } catch (error) {
+          lastError = error;
+          if (error instanceof TelegramSendSuppressedError || attempt >= maxRetries || sendSignal?.aborted) throw error;
+          await sleep(250 * Math.pow(2, attempt));
+        }
+      }
+      throw lastError;
+    },
+
+    async sendVoice(chatId, path, caption, signal, messageThreadId, replyToMessageId) {
+      const lease = captureSendLease();
+      const sendSignal = signal ?? options.getAbortSignal?.();
+      const token = requireToken();
+      const maxRetries = cfg().retryCount ?? 3;
+      const data = await readFile(path);
+      let lastError: unknown;
+      for (let attempt = 0; attempt <= maxRetries; attempt++) {
+        try {
+          ensureSendAllowed(lease);
+          const form = new FormData();
+          form.set("chat_id", String(chatId));
+          if (messageThreadId !== undefined) form.set("message_thread_id", String(messageThreadId));
+          if (replyToMessageId !== undefined) form.set("reply_parameters", JSON.stringify({ message_id: replyToMessageId }));
+          if (caption) form.set("caption", caption);
+          form.set("voice", new Blob([data], { type: "audio/ogg" }), basename(path));
+          const response = await fetch(`https://api.telegram.org/bot${token}/sendVoice`, { method: "POST", body: form, signal: sendSignal });
+          const json = await response.json() as { ok: boolean; description?: string };
+          if (!json.ok) throw new Error(json.description ?? "sendVoice failed");
+          return;
         } catch (error) {
           lastError = error;
           if (error instanceof TelegramSendSuppressedError || attempt >= maxRetries || sendSignal?.aborted) throw error;

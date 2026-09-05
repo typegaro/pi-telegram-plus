@@ -7,6 +7,8 @@ import { markdownToTelegramHtml } from "./markdown.ts";
 import type { TelegramConfig, TelegramRenderLevel, TelegramTransport, TelegramTurn } from "./types.ts";
 import { RENDER_LEVELS } from "./types.ts";
 import { log } from "./logger.ts";
+import { shouldReplyWithVoice } from "./voice/config.ts";
+import type { VoiceSubsystem } from "./voice/index.ts";
 
 const renderLog = log.child("renderer");
 
@@ -247,6 +249,8 @@ export function registerTelegramRenderer(
   deps: {
     getConfig: () => TelegramConfig;
     transport: TelegramTransport;
+    /** Optional local TTS; absent keeps legacy text-only behavior. */
+    voice?: VoiceSubsystem;
     getActiveTurn: (chatId?: number, messageThreadId?: number) => TelegramTurn | undefined;
     hasActiveTurns?: () => boolean;
   },
@@ -417,9 +421,29 @@ ${partial}`);
     const images = contentImages(message.content);
 
     const hasBody = body.trim().length > 0;
-    if (hasBody) await sendToTurn(markdownToTelegramHtml(body), { final: true });
-
     const turn = deps.getActiveTurn();
+    const wantsVoice = !!deps.voice && shouldReplyWithVoice(config, !!turn?.voiceInput);
+    if (hasBody && wantsVoice && turn) {
+      try {
+        const audio = await deps.voice!.synthesizeTelegramVoice(body);
+        try {
+          await deps.transport.sendChatAction(turn.chatId, "record_voice", turn.messageThreadId);
+          await deps.transport.sendVoice(turn.chatId, audio.oggPath, undefined, undefined, turn.messageThreadId, turn.sourceMessageId);
+        } finally {
+          await audio.cleanup();
+        }
+        if (config.voice?.sendTextWithVoice) await sendToTurn(markdownToTelegramHtml(body), { final: true });
+      } catch (error) {
+        // Do not lose a completed Pi answer when an optional local TTS dependency fails.
+        const reason = error instanceof Error ? error.message : String(error);
+        renderLog.warn("voice reply failed; using text fallback", { backend: config.voice?.tts?.backend, reason });
+        await deps.transport.sendText(turn.chatId, "Voice reply unavailable; the Pi text response is shown below.", turn.messageThreadId, turn.sourceMessageId);
+        await sendToTurn(markdownToTelegramHtml(body), { final: true });
+      }
+    } else if (hasBody) {
+      await sendToTurn(markdownToTelegramHtml(body), { final: true });
+    }
+
     if (codeFiles.length > 0) {
       const chatIds = turn ? [turn.chatId] : defaultChats();
       for (const chatId of chatIds) {

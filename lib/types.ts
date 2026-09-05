@@ -2,6 +2,43 @@ import type { AgentSession, ExtensionUIContext } from "@earendil-works/pi-coding
 
 export type TelegramRenderLevel = "hidden" | "brief" | "full";
 export type TelegramMessageMode = "queue" | "steer";
+export type VoiceReplyMode = "off" | "on" | "auto";
+export type SttBackendName = "faster-whisper" | "whisper-cpp";
+export type TtsBackendName = "piper" | "kokoro";
+
+export type VoiceConfig = {
+  enabled?: boolean;
+  replyMode?: VoiceReplyMode;
+  sendTextWithVoice?: boolean;
+  keepOriginalAudio?: boolean;
+  /** Safety limits for untrusted Telegram uploads. */
+  maxDurationSeconds?: number;
+  maxFileSizeBytes?: number;
+  timeoutMs?: number;
+  stt?: {
+    backend?: SttBackendName;
+    model?: string;
+    modelPath?: string;
+    binary?: string;
+    python?: string;
+    device?: string;
+    computeType?: string;
+    language?: string;
+  };
+  tts?: {
+    backend?: TtsBackendName;
+    binary?: string;
+    /** Python executable for worker-based engines such as Kokoro. */
+    python?: string;
+    model?: string;
+    config?: string;
+    voice?: string;
+    /** Explicit inference device/language; no hardware auto-selection occurs. */
+    device?: string;
+    language?: string;
+  };
+  audio?: { ffmpeg?: string; opusBitrate?: string };
+};
 
 export const RENDER_LEVELS: readonly TelegramRenderLevel[] = ["hidden", "brief", "full"] as const;
 export const MODE_VALUES: readonly TelegramMessageMode[] = ["queue", "steer"] as const;
@@ -45,6 +82,8 @@ export type TelegramConfig = {
   messageMode?: TelegramMessageMode;
   /** Number of retries for failed Telegram API calls (0 = no retry, default 3). */
   retryCount?: number;
+  /** Optional local STT/TTS. No voice dependencies are used when omitted. */
+  voice?: VoiceConfig;
 };
 
 export type TelegramPhotoSize = {
@@ -56,6 +95,9 @@ export type TelegramDocument = {
   file_id: string;
   file_name?: string;
   mime_type?: string;
+  file_size?: number;
+  /** Telegram voice duration, in whole seconds when provided by Bot API. */
+  duration?: number;
 };
 
 export type TelegramTextQuote = {
@@ -125,6 +167,8 @@ export type TelegramTurn = {
   replaceMessageId?: number;
   queuedAttachments: Array<{ path: string; fileName: string }>;
   attachmentsSent?: boolean;
+  /** True only for a turn created from an automatically transcribed voice note. */
+  voiceInput?: boolean;
 };
 
 export type TelegramTransport = {
@@ -143,6 +187,8 @@ export type TelegramTransport = {
   deleteMessage(chatId: number, messageId: number): Promise<void>;
   sendDocument(chatId: number, path: string, caption?: string, signal?: AbortSignal, messageThreadId?: number, replyToMessageId?: number): Promise<void>;
   sendPhoto(chatId: number, data: string, caption?: string, isPath?: boolean, signal?: AbortSignal, messageThreadId?: number, replyToMessageId?: number): Promise<void>;
+  /** Sends an Ogg/Opus file as a native Telegram voice-note bubble. */
+  sendVoice(chatId: number, path: string, caption?: string, signal?: AbortSignal, messageThreadId?: number, replyToMessageId?: number): Promise<void>;
   sendChatAction(chatId: number, action: string, messageThreadId?: number): Promise<void>;
 };
 

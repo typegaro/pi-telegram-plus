@@ -45,6 +45,9 @@ export function createActiveTelegramTransport(
         sendPhoto: (chatId, data, caption, isPath, signal, messageThreadId, replyToMessageId) => run<void>(undefined, () => (
             transport.sendPhoto(chatId, data, caption, isPath, signal, messageThreadId, replyToMessageId)
         )),
+        sendVoice: (chatId, path, caption, signal, messageThreadId, replyToMessageId) => run<void>(undefined, () => (
+            transport.sendVoice(chatId, path, caption, signal, messageThreadId, replyToMessageId)
+        )),
         sendChatAction: (chatId, action, messageThreadId) => run<void>(undefined, () => (
             transport.sendChatAction(chatId, action, messageThreadId)
         )),

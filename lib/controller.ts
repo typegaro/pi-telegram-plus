@@ -34,7 +34,7 @@ type IncomingMediaSummaryEntry = {
   fileName?: string;
 };
 
-function extractTelegramMediaEntries(message: TelegramMessage): IncomingMediaSummaryEntry[] {
+function extractTelegramMediaEntries(message: TelegramMessage, includeVoice = true): IncomingMediaSummaryEntry[] {
   const entries: IncomingMediaSummaryEntry[] = [];
   if (message.photo && message.photo.length > 0) {
     const bestPhoto = [...message.photo].reduce<TelegramPhotoSize>((best, current) => {
@@ -49,7 +49,7 @@ function extractTelegramMediaEntries(message: TelegramMessage): IncomingMediaSum
   if (message.document) documentAttachments.push({ type: "document", document: message.document });
   if (message.video) documentAttachments.push({ type: "video", document: message.video });
   if (message.audio) documentAttachments.push({ type: "audio", document: message.audio });
-  if (message.voice) documentAttachments.push({ type: "voice", document: message.voice });
+  if (includeVoice && message.voice) documentAttachments.push({ type: "voice", document: message.voice });
   if (message.animation) documentAttachments.push({ type: "animation", document: message.animation });
   if (message.sticker) documentAttachments.push({ type: "sticker", document: message.sticker });
   for (const attachment of documentAttachments) {
@@ -64,7 +64,7 @@ function extractTelegramMediaEntries(message: TelegramMessage): IncomingMediaSum
   return entries;
 }
 
-function buildTelegramIncomingMediaSummary(message: TelegramMessage, title = "[telegram attachment]"): string {
+function buildTelegramIncomingMediaSummary(message: TelegramMessage, title = "[telegram attachment]", includeVoice = true): string {
   const parts: string[] = [];
   if (message.photo && message.photo.length > 0) {
     parts.push(`- photo (${message.photo.length} photo frame(s))`);
@@ -73,7 +73,7 @@ function buildTelegramIncomingMediaSummary(message: TelegramMessage, title = "[t
   if (message.document) entries.push({ type: "document", document: message.document });
   if (message.video) entries.push({ type: "video", document: message.video });
   if (message.audio) entries.push({ type: "audio", document: message.audio });
-  if (message.voice) entries.push({ type: "voice", document: message.voice });
+  if (includeVoice && message.voice) entries.push({ type: "voice", document: message.voice });
   if (message.animation) entries.push({ type: "animation", document: message.animation });
   if (message.sticker) entries.push({ type: "sticker", document: message.sticker });
   for (const attachment of entries) {
@@ -289,9 +289,11 @@ export function createTelegramController(deps: {
   getMessageMode: () => TelegramMessageMode;
   telegramCommands: Map<string, TelegramCommandHandler>;
   getActiveTurn(chatId: number, messageThreadId?: number): TelegramTurn | undefined;
-  beginTelegramTurn(chatId: number, replaceMessageId?: number, messageThreadId?: number, sourceMessageId?: number): TelegramTurn | undefined;
+  beginTelegramTurn(chatId: number, replaceMessageId?: number, messageThreadId?: number, sourceMessageId?: number, voiceInput?: boolean): TelegramTurn | undefined;
   endTelegramTurn(chatId: number, turn: TelegramTurn): void;
   saveIncomingTelegramAttachment?: (fileId: string, fileName: string | undefined, kind: string) => Promise<string>;
+  /** Performs local STT after authorization, before this message is sent to Pi. */
+  transcribeIncomingVoice?: (message: TelegramMessage) => Promise<string>;
 }): TelegramController {
   const targetKey = (chatId: number, messageThreadId?: number) => `${chatId}:${messageThreadId ?? "main"}`;
   // Per chat/thread prompt queues: each Telegram topic chains independently.
@@ -326,7 +328,7 @@ export function createTelegramController(deps: {
       .catch(ctrlLog.swallow("warn", "sendText prompt-failure notice failed", { chatId, messageThreadId, sourceMessageId }));
   };
 
-  const runPrompt = async (text: string, chatId: number, replaceMessageId?: number, messageThreadId?: number, sourceMessageId?: number) => {
+  const runPrompt = async (text: string, chatId: number, replaceMessageId?: number, messageThreadId?: number, sourceMessageId?: number, voiceInput = false) => {
     const session = deps.getSession();
     if (!session) {
       if (replaceMessageId !== undefined) await deps.transport.editText(chatId, replaceMessageId, "π session is not ready yet.");
@@ -344,7 +346,7 @@ export function createTelegramController(deps: {
       const existingTurn = deps.getActiveTurn(chatId, messageThreadId);
       if (!existingTurn) {
         // No active turn to steer into — fall back to a new prompt.
-        const turn = deps.beginTelegramTurn(chatId, undefined, messageThreadId, sourceMessageId);
+        const turn = deps.beginTelegramTurn(chatId, undefined, messageThreadId, sourceMessageId, voiceInput);
         if (!turn) {
           await deps.transport.sendText(chatId, "⏳ π is busy. Try again shortly.", messageThreadId, sourceMessageId);
           return;
@@ -377,7 +379,7 @@ export function createTelegramController(deps: {
       return;
     }
 
-    const turn = deps.beginTelegramTurn(chatId, replaceMessageId, messageThreadId, sourceMessageId);
+    const turn = deps.beginTelegramTurn(chatId, replaceMessageId, messageThreadId, sourceMessageId, voiceInput);
     if (!turn) {
       // Target already has an active turn — reject with a busy message.
       if (replaceMessageId !== undefined) await deps.transport.editText(chatId, replaceMessageId, "⏳ π is busy. Try again shortly.");
@@ -406,10 +408,10 @@ export function createTelegramController(deps: {
     }
   };
 
-  const submitText = async (text: string, chatId: number, replaceMessageId?: number, messageThreadId?: number, sourceMessageId?: number) => {
+  const submitText = async (text: string, chatId: number, replaceMessageId?: number, messageThreadId?: number, sourceMessageId?: number, voiceInput = false) => {
     const mode = deps.getMessageMode();
     if (mode === "steer") {
-      const task = runPrompt(text, chatId, replaceMessageId, messageThreadId, sourceMessageId);
+      const task = runPrompt(text, chatId, replaceMessageId, messageThreadId, sourceMessageId, voiceInput);
       void task.catch((err) => reportPromptFailure("steer-mode", chatId, messageThreadId, sourceMessageId, err));
       return;
     }
@@ -421,7 +423,7 @@ export function createTelegramController(deps: {
     const task = getOrCreateTail(key)
       .then(() => {
         if (generation !== getInterruptGeneration(key)) return;
-        return runPrompt(text, chatId, replaceMessageId, messageThreadId, sourceMessageId);
+        return runPrompt(text, chatId, replaceMessageId, messageThreadId, sourceMessageId, voiceInput);
       })
       .catch((err) => reportPromptFailure("queue-mode", chatId, messageThreadId, sourceMessageId, err));
     setTail(key, task);
@@ -554,7 +556,7 @@ export function createTelegramController(deps: {
       if (typeof chatId !== "number") return;
       const messageThreadId = message.message_thread_id;
       const sourceMessageId = message.message_id;
-      const rawText = message.text ?? message.caption ?? "";
+      let rawText = message.text ?? message.caption ?? "";
       ctrlLog.debug("incoming telegram message shape", {
         messageId: message.message_id,
         keys: Object.keys(message),
@@ -571,8 +573,8 @@ export function createTelegramController(deps: {
         return;
       }
 
-      const text = normalizeLeadingCommand(rawText, deps.getBotUsername());
-      const trimmed = text.trim();
+      let text = normalizeLeadingCommand(rawText, deps.getBotUsername());
+      let trimmed = text.trim();
       const replyToInput = message.reply_to_message?.message_id;
       if (message.reply_to_message || message.quote || message.text_quote || message.external_reply) logTelegramReplyContext(message);
       if (trimmed === "/stop") {
@@ -589,10 +591,30 @@ export function createTelegramController(deps: {
         return;
       }
 
-      const mediaSummary = buildTelegramIncomingMediaSummary(message);
+      // Voice STT is deliberately before prompt construction. Pi receives the transcript,
+      // never a request to decide whether it should transcribe audio.
+      let voiceInput = false;
+      if (message.voice && deps.transcribeIncomingVoice) {
+        try {
+          rawText = await deps.transcribeIncomingVoice(message);
+          text = normalizeLeadingCommand(rawText, deps.getBotUsername());
+          trimmed = text.trim();
+          if (!trimmed) {
+            await deps.transport.sendText(chatId, "Voice transcription was empty. Please try again.", messageThreadId, sourceMessageId);
+            return;
+          }
+          voiceInput = true;
+        } catch (error) {
+          const reason = error instanceof Error ? error.message : String(error);
+          await deps.transport.sendText(chatId, `Voice transcription failed: ${reason.slice(0, 280)}`, messageThreadId, sourceMessageId);
+          return;
+        }
+      }
+      // A handled voice note is not also saved/reported as an ordinary attachment.
+      const mediaSummary = buildTelegramIncomingMediaSummary(message, "[telegram attachment]", !voiceInput);
       const hasMediaInput = mediaSummary.length > 0;
-      const hasTextInput = message.text !== undefined || message.caption !== undefined;
-      const incomingMedia = hasMediaInput ? extractTelegramMediaEntries(message) : [];
+      const hasTextInput = message.text !== undefined || message.caption !== undefined || voiceInput;
+      const incomingMedia = hasMediaInput ? extractTelegramMediaEntries(message, !voiceInput) : [];
       const downloadedMediaLines: string[] = [];
       const failedMediaLines: string[] = [];
       if (deps.saveIncomingTelegramAttachment && incomingMedia.length > 0) {
@@ -651,7 +673,7 @@ export function createTelegramController(deps: {
           const finalPrompt = quotedBlock
             ? `${quotedBlock}\n\n[telegram message]\n${promptText}`.trim()
             : promptText;
-          await submitText(finalPrompt, chatId, undefined, messageThreadId, sourceMessageId);
+          await submitText(finalPrompt, chatId, undefined, messageThreadId, sourceMessageId, voiceInput);
         }
       }
     },

@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, rm, writeFile } from "node:fs/promises";
 import { basename, extname, join, resolve } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { createActiveTelegramTransport } from "./lib/active-transport.ts";
@@ -20,9 +20,12 @@ import { createTelegramPollingRuntime } from "./lib/polling.ts";
 import { initLogger, log, type LogLevel } from "./lib/logger.ts";
 import { authorizeTelegramUser, ensureTelegramPairingCode, formatPairingInstructions } from "./lib/pairing.ts";
 import { getCurrentTelegramTurn } from "./lib/turn-context.ts";
+import { VoiceSubsystem } from "./lib/voice/index.ts";
+import { validateVoiceConfig, voiceLimits } from "./lib/voice/config.ts";
 
 import { registerAllCommands } from "./lib/commands/register.ts";
 import { registerTelegramCommands } from "./lib/commands/telegram-commands.ts";
+import { registerVoiceCommands } from "./lib/commands/voice.ts";
 import { syncTelegramCommands } from "./lib/menu-commands.ts";
 import type { ResolvedTelegramConfig, TelegramConfig, TelegramTurn } from "./lib/types.ts";
 
@@ -64,6 +67,8 @@ export default function piTelegramPlus(pi: ExtensionAPI): void {
   runtimeState.dispose?.();
 
   let config: TelegramConfig = {};
+  // Constructing this does not start Python, ffmpeg, or download any model.
+  const voice = new VoiceSubsystem(() => config);
   let resolvedConfig: ResolvedTelegramConfig | undefined;
   let coordinator: TelegramInstanceCoordinator | undefined;
   let coordinatorTimer: ReturnType<typeof setInterval> | undefined;
@@ -223,6 +228,13 @@ export default function piTelegramPlus(pi: ExtensionAPI): void {
     getActiveTurn: getCurrentActiveTurn,
   });
 
+  registerVoiceCommands({
+    registerCommand: (name: string, options: { description?: string; handler: TelegramCommandHandler }) => {
+      telegramCommands.set(name, options.handler);
+      if (options.description) pi.registerCommand(name, { description: options.description, handler: options.handler });
+    },
+  }, tgConfigDeps);
+
   registerTelegramCommands({
     registerCommand: (name: string, options: { description?: string; handler: TelegramCommandHandler }) => {
       telegramCommands.set(name, options.handler);
@@ -255,12 +267,24 @@ export default function piTelegramPlus(pi: ExtensionAPI): void {
   registerTelegramRenderer(pi, {
     getConfig: () => config,
     transport,
+    voice,
     getActiveTurn: (chatId?: number, messageThreadId?: number) => {
       if (chatId !== undefined) return activeTurns.get(activeTurnKey(chatId, messageThreadId));
       return getCurrentActiveTurn();
     },
     hasActiveTurns: () => activeTurns.size > 0,
   });
+
+  const saveIncomingTelegramAttachment = async (fileId: string, fileName: string | undefined, kind: string): Promise<string> => {
+    const token = config.botToken;
+    if (!token) throw new Error("Telegram bot token is not configured");
+    const fileInfo = await getTelegramFile(token, fileId);
+    const data = await downloadTelegramFile(token, fileInfo.file_path);
+    await mkdir(currentSessionCwd(), { recursive: true });
+    const outputPath = buildIncomingAttachmentPath(fileId, fileName || kind, fileInfo.file_path);
+    await writeFile(outputPath, data);
+    return outputPath;
+  };
 
   const controller = createTelegramController({
     getSession: getActiveSession,
@@ -277,24 +301,30 @@ export default function piTelegramPlus(pi: ExtensionAPI): void {
       return decision.paired ? "paired" : true;
     },
     telegramCommands,
-    saveIncomingTelegramAttachment: async (fileId, fileName, kind) => {
-      const token = config.botToken;
-      if (!token) {
-        throw new Error("Telegram bot token is not configured");
+    saveIncomingTelegramAttachment,
+    transcribeIncomingVoice: async (message) => {
+      if (!config.voice?.enabled) throw new Error("local voice processing is disabled");
+      const limits = voiceLimits(config);
+      const media = message.voice;
+      if (!media) throw new Error("Telegram voice attachment is missing");
+      if (media.duration !== undefined && media.duration > limits.maxDurationSeconds) {
+        throw new Error(`voice message exceeds configured ${limits.maxDurationSeconds}s duration limit`);
       }
-      const fileInfo = await getTelegramFile(token, fileId);
-      const data = await downloadTelegramFile(token, fileInfo.file_path);
-      await mkdir(currentSessionCwd(), { recursive: true });
-      const candidateName = buildIncomingAttachmentPath(fileId, fileName || kind, fileInfo.file_path);
-      const outputPath = candidateName;
-      await writeFile(outputPath, data);
-      return outputPath;
+      if (media.file_size !== undefined && media.file_size > limits.maxFileSizeBytes) {
+        throw new Error(`voice message exceeds configured ${limits.maxFileSizeBytes} byte limit`);
+      }
+      const localPath = await saveIncomingTelegramAttachment(media.file_id, media.file_name ?? "voice.ogg", "voice");
+      try {
+        return (await voice.transcribe(localPath)).text;
+      } finally {
+        if (!config.voice?.keepOriginalAudio) await rm(localPath, { force: true }).catch(indexLog.swallow("debug", "remove temporary voice source failed", { localPath }));
+      }
     },
     getActiveTurn: (chatId: number, messageThreadId?: number) => activeTurns.get(activeTurnKey(chatId, messageThreadId)),
-    beginTelegramTurn: (chatId, replaceMessageId, messageThreadId, sourceMessageId) => {
+    beginTelegramTurn: (chatId, replaceMessageId, messageThreadId, sourceMessageId, voiceInput = false) => {
       const key = activeTurnKey(chatId, messageThreadId);
       if (activeTurns.has(key)) return undefined; // reject if this chat/thread is busy
-      const turn: TelegramTurn = { chatId, messageThreadId, sourceMessageId, replaceMessageId, queuedAttachments: [] };
+      const turn: TelegramTurn = { chatId, messageThreadId, sourceMessageId, replaceMessageId, voiceInput, queuedAttachments: [] };
       activeTurns.set(key, turn);
       refreshStatus();
       return turn;
@@ -707,6 +737,7 @@ export default function piTelegramPlus(pi: ExtensionAPI): void {
     releaseReplayGate?.();
     void polling.stop();
     heartbeat.dispose();
+    void voice.dispose();
     activeTurns.clear();
     ui.dispose();
     clearStatus();
@@ -723,6 +754,11 @@ export default function piTelegramPlus(pi: ExtensionAPI): void {
         `Telegram config is not v2 yet. Run /tg-global-setup to recreate it. ${error instanceof Error ? error.message : String(error)}`,
         "error",
       );
+    }
+    const voiceErrors = validateVoiceConfig(config);
+    if (voiceErrors.length > 0) {
+      indexLog.warn("voice configuration is incomplete", { errors: voiceErrors });
+      getActiveSession()?.extensionRunner.getUIContext().notify(`Telegram voice configuration: ${voiceErrors[0]}`, "warning");
     }
     const startupConfig = enableConfiguredTelegramOnStartup(config);
     if (startupConfig !== config) {

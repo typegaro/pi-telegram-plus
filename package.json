@@ -19,6 +19,7 @@
   "files": [
     "index.ts",
     "lib/**/*.ts",
+    "lib/**/*.py",
     "!lib/__tests__/",
     "pi-host.d.ts"
   ],
@@ -48,6 +49,7 @@
     "marked": "^18.0.4"
   },
   "devDependencies": {
+    "@types/node": "^22.15.3",
     "typescript": "^6.0.3",
     "vitest": "^4.1.8"
   }

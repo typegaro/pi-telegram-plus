@@ -279,3 +279,217 @@ Common issues and diagnostic steps. The extension writes a structured JSON Lines
 ### Configuration changes are not picked up
 - Per-workspace bindings live in `~/.pi/agent/tg.json`. After editing by hand, run `/reload` (or restart pi) so the extension re-reads config.
 - Workspace bindings override the global token. If the wrong bot responds, run `/tg-list` and `/tg-unbind-cwd` to clear the unintended override.
+---
+
+## Local Telegram voice messages
+
+`pi-telegram-plus` can process Telegram voice notes entirely on the local machine running Pi:
+
+```text
+Telegram Ogg/Opus → local download → local STT → Pi → local TTS → ffmpeg → Telegram sendVoice
+```
+
+Telegram is still the message transport. Speech recognition, synthesis, audio conversion, and model inference are local; this extension does **not** call OpenAI, Google, Azure, ElevenLabs, or another cloud speech API. Voice is opt-in. Text-only Telegram use does not require Python, ffmpeg, STT/TTS binaries, or any model.
+
+### Install the extension fork
+
+Install this directory manually as a Pi extension (or publish/install its npm package), then configure the normal Telegram connection as documented above. The extension config remains in `~/.pi/agent/tg.json` (or `$PI_CODING_AGENT_DIR/tg.json`), under the existing `global` or workspace `config` object. No model is downloaded during normal voice-message processing; an authorized user may explicitly use `/tg-voice-install` to install an allow-listed model.
+
+Local executable dependencies are optional and must be installed by the operator:
+
+- `ffmpeg` (with `libopus`)
+- Python 3 and `faster-whisper` for the faster-whisper backend
+- **or** an already-installed `whisper-cli` from whisper.cpp
+- `piper` for Piper output
+- optional Kokoro Python runtime (`kokoro==0.7.16` and `misaki[en]`), installable through the explicit runtime menu
+
+### Example configuration
+
+```json
+{
+  "voice": {
+    "enabled": true,
+    "replyMode": "auto",
+    "sendTextWithVoice": false,
+    "keepOriginalAudio": false,
+    "maxDurationSeconds": 600,
+    "maxFileSizeBytes": 20971520,
+    "timeoutMs": 120000,
+    "stt": {
+      "backend": "faster-whisper",
+      "model": "large-v3-turbo",
+      "modelPath": "~/.pi/agent/models/stt/whisper-large-v3-turbo",
+      "device": "cuda",
+      "computeType": "float16",
+      "language": "auto"
+    },
+    "tts": {
+      "backend": "piper",
+      "binary": "piper",
+      "model": "~/.pi/agent/models/tts/en_US-lessac-medium.onnx"
+    },
+    "audio": { "ffmpeg": "ffmpeg", "opusBitrate": "32k" }
+  }
+}
+```
+
+For CPU use, explicitly select it; hardware is never auto-detected or selected:
+
+```json
+"stt": {
+  "backend": "faster-whisper",
+  "model": "small",
+  "modelPath": "~/.pi/agent/models/stt/whisper-small",
+  "device": "cpu",
+  "computeType": "int8",
+  "language": "auto"
+}
+```
+
+`replyMode` controls only output format:
+
+| Mode | Text input | Voice input |
+|---|---|---|
+| `off` | text reply | text reply after local STT |
+| `on` | local voice reply | local voice reply |
+| `auto` (recommended) | text reply | local voice reply |
+
+When TTS fails, the completed Pi text response is sent instead. If a configured STT model is missing, the authorized sender receives a concise error including its expected manual path. Unauthorized users are rejected before a file is downloaded or STT is invoked.
+
+### Manual STT model setup
+
+Models can be placed manually, or an authorized paired user can explicitly choose one from `/tg-voice-install`. The installer downloads only the fixed allow-listed sources documented here into the fixed paths, stages downloads before moving them into place, and verifies Hugging Face LFS SHA-256 metadata when available. It accepts no URLs, paths, executables, archives, or shell commands from Telegram. `faster-whisper` needs a local CTranslate2 model directory; the worker passes the local path to `WhisperModel` with `local_files_only=True`, so normal transcription can never fetch a missing model.
+
+**faster-whisper / CTranslate2 (unquantized reference download sizes)**
+
+| Model | Approximate on-disk model size | Example local directory |
+|---|---:|---|
+| tiny | ~75 MB | `~/.pi/agent/models/stt/whisper-tiny/` |
+| base | ~142 MB | `~/.pi/agent/models/stt/whisper-base/` |
+| small | ~466 MB | `~/.pi/agent/models/stt/whisper-small/` |
+| medium | ~1.5 GB | `~/.pi/agent/models/stt/whisper-medium/` |
+| large-v3 | ~3.1 GB | `~/.pi/agent/models/stt/whisper-large-v3/` |
+| large-v3-turbo | ~1.6 GB | `~/.pi/agent/models/stt/whisper-large-v3-turbo/` |
+
+Example: download the **CTranslate2** `large-v3-turbo` files manually into `~/.pi/agent/models/stt/whisper-large-v3-turbo/`, then use exactly:
+
+```json
+"modelPath": "~/.pi/agent/models/stt/whisper-large-v3-turbo"
+```
+
+The alternative backend uses an already-installed whisper.cpp CLI and an explicitly supplied GGML/GGUF model; it never invokes a shell:
+
+```json
+"stt": {
+  "backend": "whisper-cpp",
+  "binary": "/usr/local/bin/whisper-cli",
+  "model": "~/.pi/agent/models/stt/ggml-small.bin",
+  "language": "auto"
+}
+```
+
+**whisper.cpp legacy GGML `.bin` reference sizes** (download the matching file manually from the [ggerganov/whisper.cpp model releases](https://github.com/ggerganov/whisper.cpp/blob/master/models/download-ggml-model.sh)):
+
+| Model file | Approximate on-disk size | Manual destination |
+|---|---:|---|
+| `ggml-tiny.bin` | ~75 MB | `~/.pi/agent/models/stt/ggml-tiny.bin` |
+| `ggml-base.bin` | ~142 MB | `~/.pi/agent/models/stt/ggml-base.bin` |
+| `ggml-small.bin` | ~466 MB | `~/.pi/agent/models/stt/ggml-small.bin` |
+| `ggml-medium.bin` | ~1.5 GB | `~/.pi/agent/models/stt/ggml-medium.bin` |
+| `ggml-large-v3.bin` | ~3.1 GB | `~/.pi/agent/models/stt/ggml-large-v3.bin` |
+
+Sizes are distribution-specific: GGUF quantization changes them substantially. **Disk model size is not RAM/VRAM requirement**; backend, quantization, batch settings, and audio buffers change runtime memory use.
+
+### Manual local TTS setup
+
+For the documented Piper example, manually download the `en_US-lessac-medium` ONNX voice and its matching JSON config from the [Piper voices release/index](https://github.com/rhasspy/piper/blob/master/VOICES.md). Place both files locally:
+
+```text
+~/.pi/agent/models/tts/en_US-lessac-medium.onnx       (~60 MB, current medium voice release)
+~/.pi/agent/models/tts/en_US-lessac-medium.onnx.json  (~4 KB metadata/config)
+```
+
+Then configure:
+
+```json
+"tts": {
+  "backend": "piper",
+  "binary": "piper",
+  "model": "~/.pi/agent/models/tts/en_US-lessac-medium.onnx",
+  "config": "~/.pi/agent/models/tts/en_US-lessac-medium.onnx.json"
+}
+```
+
+For a noticeably better Piper result, use the allow-listed `en_US-lessac-high` voice: approximately **~114 MB** plus its JSON config, installed at `~/.pi/agent/models/tts/en_US-lessac-high.onnx`. From Telegram, run `/tg-voice-install tts en_US-lessac-high`, confirm the fixed source/path, then select it with `/tg-voice-model tts en_US-lessac-high`. It uses more CPU and is still Piper, but is higher quality than Lessac-medium.
+
+Piper voice sizes vary by voice and quality, so treat the stated Lessac-medium size as the referenced release's approximate download, not a universal Piper size. Runtime memory can be larger/different than the `.onnx` size.
+
+Kokoro-82M is the higher-quality fully local option. The allow-listed `af_heart` English voice is typically more natural and expressive than Piper, at roughly **~330 MB** for the model/config/voice files (plus a potentially large PyTorch runtime). Kokoro releases currently require Python 3.8–3.12; the installer creates `~/.pi/agent/voice-venv-kokoro` rather than reusing an incompatible system/Piper venv. It is a persistent local Python worker, never a cloud API.
+
+Install it through the explicit menus:
+
+```text
+/tg-voice-runtime-install kokoro
+/tg-voice-install tts kokoro-af-heart
+/tg-voice-model tts kokoro-af-heart
+```
+
+The installed paths are fixed:
+
+```text
+~/.pi/agent/models/tts/kokoro-v1_0.pth
+~/.pi/agent/models/tts/kokoro-config.json
+~/.pi/agent/models/tts/kokoro-af_heart.pt
+```
+
+The backend is configured without automatic device selection; CPU is the default. A user who has a working local CUDA PyTorch runtime may explicitly set `voice.tts.device` to `cuda`.
+
+### Voice commands
+
+All commands use the existing Telegram authorization/pairing gate:
+
+| Command | Purpose |
+|---|---|
+| `/voice status` | configured backends, model paths, and missing-model diagnostics |
+| `/voice on` | enable voice output for every reply |
+| `/voice off` | retain local STT but send text replies |
+| `/voice auto` | voice replies only to voice input |
+| `/stt status` | STT diagnostics |
+| `/stt language auto` | automatic recognition language |
+| `/stt language en` / `/stt language it` | explicit recognition language |
+| `/tts status` | TTS diagnostics |
+| `/tg-voice-runtime-install` | Explicitly creates the isolated local Python venv and installs fixed `faster-whisper` and `piper-tts` packages from PyPI; never uses sudo |
+| `/tg-voice-runtime-install kokoro` | Explicitly installs the fixed local Kokoro/PyTorch/G2P runtime in a separate Python 3.8–3.12 venv; on NixOS it can build fixed `nixpkgs#python312` |
+| `/tg-voice-install tts kokoro-af-heart` | Downloads the allow-listed Kokoro-82M model/config/af_heart voice (~330 MB) |
+| `/tg-voice-install` | Interactive, explicitly confirmed download of an allow-listed local model/voice from its documented source |
+| `/tg-voice-setup` | Interactive wizard to select supported **already-installed** STT and Piper models and save configuration |
+| `/tg-voice-status` | Alias for voice diagnostics |
+| `/tg-voice-mode auto\|on\|off` | Set reply mode |
+| `/tg-voice-model stt small` | Select a known installed STT model |
+| `/tg-voice-model tts en_US-lessac-medium` | Select a known installed Piper voice |
+| `/tg-voice-model tts en_US-lessac-high` | Select the higher-quality Lessac Piper voice |
+| `/tg-voice-language auto\|en\|it` | Set STT language |
+
+**Recommended UX:** run `/tg-voice-setup` once. It presents STT/TTS choices with quality and model size, asks for confirmation, then automatically provisions the fixed local Python backend required by the selected model and downloads/configures that model. `/tg-voice-model` is the same model selector/installer when used without arguments. Advanced users may still use `/tg-voice-runtime-install` and `/tg-voice-install` separately.
+
+No command accepts paths/executable names from Telegram. The fixed runtime/model installers require confirmation and never install system Python, ffmpeg, CUDA drivers, use sudo, or accept arbitrary packages/URLs.
+
+`/voice on|off|auto` does not choose or download models. It only changes reply mode. Model paths and executable paths are configuration-only, never accepted from chat commands.
+
+### Operations, safety, and manual test
+
+Incoming Telegram voice files are size- and duration-limited before inference; all subprocesses use argument arrays and timeout/kill handling. Per-request temp directories make TTS output unique. The faster-whisper Python worker uses request IDs over JSON lines and holds its model in memory for later notes. Source audio, WAV, and Ogg files are removed after use unless `keepOriginalAudio` is true (only the source audio is retained in that case). Full transcripts are not logged.
+
+To manually test a round trip:
+
+1. Install ffmpeg, a local Piper voice, Python/faster-whisper, and a CTranslate2 Whisper model manually.
+2. Create the directory paths shown above and add the configuration example to the appropriate existing `tg.json` config scope.
+3. Start Pi with the extension, pair the Telegram account normally, and send `/voice status`; confirm model paths report `ready`.
+4. Send a Telegram voice note: “Check the current git status and tell me what changed.”
+5. Confirm Pi receives the transcript, performs its normal tools/response, and Telegram receives an Ogg/Opus native voice-note bubble.
+6. Send text `Hello` with `replyMode: auto`; it must receive a normal Telegram text response.
+7. Temporarily rename a model file to verify the expected-path STT error; temporarily remove Piper/ffmpeg to verify the Pi text fallback.
+
+### NixOS native-library note
+
+On NixOS, CTranslate2 wheels used by `faster-whisper` may not find `libstdc++.so.6` through the normal dynamic-loader search path. When Pi is launched with the standard NixOS `NIX_LD_LIBRARY_PATH`, the extension forwards that path to the local STT worker automatically. Restart Pi after updating the extension. If you run Pi from a custom stripped environment, launch it with `NIX_LD_LIBRARY_PATH` preserved.
