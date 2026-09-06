@@ -6,7 +6,7 @@ import { escapeHtml } from "../html.ts";
 import { expandHome, validateVoiceConfig, voiceReplyMode } from "../voice/config.ts";
 import { getAgentDir } from "../config.ts";
 import { nativeLibraryEnvironment, runProcess } from "../voice/audio/process.ts";
-import { installVoiceModel, type VoiceModelInstall } from "../voice/installer.ts";
+import { installVoiceModel, isVoiceModelInstalled, type VoiceModelInstall } from "../voice/installer.ts";
 import type { TelegramConfig, VoiceReplyMode } from "../types.ts";
 
 export type VoiceCommandDeps = {
@@ -80,6 +80,9 @@ function status(config: TelegramConfig): string {
   const tts = voice.tts;
   const errors = validateVoiceConfig(config);
   const modelStatus = (path: string | undefined) => path ? (existsSync(expandHome(path)) ? "ready" : "missing") : "not configured";
+  const ttsModelStatus = tts?.backend === "kokoro"
+    ? [tts.model, tts.config, tts.voice].every((path) => path && existsSync(expandHome(path))) ? "ready" : "incomplete"
+    : modelStatus(tts?.model);
   return [
     "<b>Voice subsystem</b>",
     `Reply mode: <b>${voiceReplyMode(config)}</b>`,
@@ -93,7 +96,7 @@ function status(config: TelegramConfig): string {
     "<b>TTS</b>",
     `backend: ${escapeHtml(tts?.backend ?? "not configured")}`,
     `model: ${escapeHtml(tts?.model ?? "not configured")}`,
-    `status: ${modelStatus(tts?.model)}`,
+    `status: ${ttsModelStatus}`,
     tts?.backend === "kokoro"
       ? `Kokoro runtime: ${pythonPackageStatus(tts.python ?? stt?.python ?? "python3", "kokoro")}`
       : `Piper executable: ${executableStatus(tts?.binary ?? "piper")}`, 
@@ -103,8 +106,8 @@ function status(config: TelegramConfig): string {
   ].join("\n");
 }
 
-function installedSttModels(): KnownSttModel[] { return KNOWN_STT_MODELS.filter((model) => existsSync(expandHome(model.path))); }
-function installedTtsModels(): KnownTtsModel[] { return KNOWN_TTS_MODELS.filter((model) => existsSync(expandHome(model.path))); }
+function installedSttModels(): KnownSttModel[] { return KNOWN_STT_MODELS.filter((model) => isVoiceModelInstalled(model.install)); }
+function installedTtsModels(): KnownTtsModel[] { return KNOWN_TTS_MODELS.filter((model) => isVoiceModelInstalled(model.install)); }
 function configuredPiperBinary(config: TelegramConfig): string {
   const configured = config.voice?.tts?.binary;
   if (configured) return configured;
@@ -175,7 +178,7 @@ async function selectModel(args: string, ctx: { ui: Ui }, deps: VoiceCommandDeps
   if (kind === "stt") {
     const model = KNOWN_STT_MODELS.find((item) => item.id === id);
     if (!model) { ctx.ui.notify("Usage: /tg-voice-model stt small|large-v3-turbo|whisper-cpp-small", "error"); return; }
-    if (!existsSync(expandHome(model.path))) { await installModel(`stt ${model.id}`, ctx, deps); return; }
+    if (!isVoiceModelInstalled(model.install)) { await installModel(`stt ${model.id}`, ctx, deps); return; }
     await ensureRuntimeForChoice({ kind: "stt", id: model.id, label: model.label, quality: model.quality, install: model.install }, ctx, deps);
     config = deps.getConfig();
     const stt = model.backend === "faster-whisper"
@@ -187,7 +190,7 @@ async function selectModel(args: string, ctx: { ui: Ui }, deps: VoiceCommandDeps
   if (kind === "tts") {
     const model = KNOWN_TTS_MODELS.find((item) => item.id.toLowerCase() === id);
     if (!model) { ctx.ui.notify("Usage: /tg-voice-model tts en_US-lessac-medium|en_US-lessac-high|kokoro-af-heart", "error"); return; }
-    if (!existsSync(expandHome(model.path))) { await installModel(`tts ${model.id}`, ctx, deps); return; }
+    if (!isVoiceModelInstalled(model.install)) { await installModel(`tts ${model.id}`, ctx, deps); return; }
     await ensureRuntimeForChoice({ kind: "tts", id: model.id, label: model.label, quality: model.quality, install: model.install }, ctx, deps);
     config = deps.getConfig();
     const tts = model.backend === "kokoro"
@@ -229,7 +232,7 @@ async function installModel(args: string, ctx: { ui: Ui }, deps: VoiceCommandDep
     if (!selected) return;
     choice = choices[labels.indexOf(selected)];
   }
-  if (existsSync(expandHome(choice.install.installedPath))) {
+  if (isVoiceModelInstalled(choice.install)) {
     ctx.ui.notify("That model is already installed; checking its local backend now.", "info");
     await ensureRuntimeForChoice(choice, ctx, deps);
     await selectModel(`${choice.kind} ${choice.id}`, ctx, deps);
@@ -435,6 +438,59 @@ async function interactiveSetup(ctx: { ui: Ui }, deps: VoiceCommandDeps): Promis
   ctx.ui.notify(`✅ Local voice setup saved.\n\n${status(deps.getConfig())}`, "info");
 }
 
+async function healthCheck(ctx: { ui: Ui }, deps: VoiceCommandDeps): Promise<void> {
+  const config = deps.getConfig();
+  const stt = config.voice?.stt;
+  const tts = config.voice?.tts;
+  const sttModel = KNOWN_STT_MODELS.find((model) => model.backend === stt?.backend
+    && (model.backend === "faster-whisper" ? stt.modelPath === model.path : stt.model === model.path));
+  const ttsModel = KNOWN_TTS_MODELS.find((model) => model.backend === tts?.backend && tts.model === model.path);
+  const incomplete = [sttModel, ttsModel].filter((model) => model && !isVoiceModelInstalled(model.install));
+  const sttPython = stt?.python ?? configuredPython(config);
+  const ttsPython = tts?.python ?? stt?.python ?? "python3";
+  const needsBase = (stt?.backend === "faster-whisper" && pythonPackageStatus(sttPython, "faster_whisper") !== "available")
+    || (tts?.backend === "piper" && executableStatus(tts.binary ?? configuredPiperBinary(config)) !== "available");
+  const needsKokoro = tts?.backend === "kokoro" && pythonPackageStatus(ttsPython, "kokoro") !== "available";
+  const manualIssues: string[] = [];
+  if (config.voice?.audio?.ffmpeg !== undefined && executableStatus(config.voice.audio.ffmpeg) !== "available") manualIssues.push(`FFmpeg is unavailable: ${config.voice.audio.ffmpeg}`);
+  if (stt?.backend === "whisper-cpp" && executableStatus(stt.binary ?? "whisper-cli") !== "available") manualIssues.push(`whisper.cpp executable is unavailable: ${stt.binary ?? "whisper-cli"}`);
+  for (const error of validateVoiceConfig(config)) {
+    const coveredByKnownModel = incomplete.some((model) => error.includes(model!.path) || ("config" in model! && error.includes(model!.config)) || ("voice" in model! && model!.voice && error.includes(model!.voice)));
+    if (!coveredByKnownModel) manualIssues.push(error);
+  }
+  const repairLines = [
+    ...(needsBase ? ["Install/repair the isolated faster-whisper/Piper runtime"] : []),
+    ...(needsKokoro ? ["Install/repair the isolated Kokoro runtime and save its Python path"] : []),
+    ...incomplete.map((model) => `Complete ${model!.install.label} (${model!.install.size}) at ${model!.install.installedPath}`),
+  ];
+  if (repairLines.length === 0) {
+    const heading = manualIssues.length ? "No safe automatic repair is available for the remaining issue(s)." : "✅ Voice health check passed.";
+    ctx.ui.notify([heading, ...manualIssues.map((issue) => `• ${issue}`), "", status(config)].join("\n"), manualIssues.length ? "warning" : "info");
+    return;
+  }
+  const confirmed = await ctx.ui.confirm(
+    "Repair local voice setup?",
+    `${repairLines.map((line) => `• ${line}`).join("\n")}${manualIssues.length ? `\n\nManual attention also needed:\n${manualIssues.map((issue) => `• ${issue}`).join("\n")}` : ""}\n\nOnly fixed allow-listed local runtimes/model files will be installed. Existing model files are kept.`,
+  );
+  if (!confirmed) return;
+  try {
+    if (needsBase) await installRuntime("base", ctx, deps, { skipConfirmation: true, throwOnFailure: true });
+    if (needsKokoro) await installRuntime("kokoro", ctx, deps, { skipConfirmation: true, throwOnFailure: true });
+    for (const model of incomplete) {
+      let lastProgress = "";
+      await installVoiceModel(model!.install, (progress) => {
+        if (progress !== lastProgress) { lastProgress = progress; ctx.ui.notify(progress, "info"); }
+      });
+      const kind = KNOWN_STT_MODELS.includes(model as KnownSttModel) ? "stt" : "tts";
+      await selectModel(`${kind} ${model!.id}`, ctx, deps);
+    }
+    ctx.ui.notify(`✅ Voice health check and repair completed.\n\n${status(deps.getConfig())}`, manualIssues.length ? "warning" : "info");
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    ctx.ui.notify(`Voice health repair failed: ${reason.slice(0, 400)}\n\n${status(deps.getConfig())}`, "error");
+  }
+}
+
 export function registerVoiceCommands(
   registry: { registerCommand: (name: string, options: { description?: string; handler: (args: string, ctx: any) => Promise<void> }) => void },
   deps: VoiceCommandDeps,
@@ -454,6 +510,10 @@ export function registerVoiceCommands(
   registry.registerCommand("tg-voice-install", { handler: (args, ctx) => installModel(args, ctx, deps) });
   registry.registerCommand("tg-voice-runtime-install", { handler: async (args, ctx) => { await installRuntime(args, ctx, deps); } });
   registry.registerCommand("tg-voice-status", { description: "Show local voice diagnostics", handler: async (_args, ctx) => ctx.ui.notify(status(deps.getConfig()), "info") });
+  registry.registerCommand("tg-voice-healthcheck", { description: "Diagnose and repair local voice setup", handler: async (_args, ctx) => healthCheck(ctx, deps) });
+  // Keep the spelling from the original request working without putting a
+  // duplicate entry in Telegram's normal command menu.
+  registry.registerCommand("tg-voice-heltcheck", { handler: async (_args, ctx) => healthCheck(ctx, deps) });
   registry.registerCommand("tg-voice-mode", { description: "Set voice reply mode", handler: (args, ctx) => setReplyMode(args, ctx, deps) });
   registry.registerCommand("tg-voice-model", { description: "Select an installed local voice model", handler: (args, ctx) => selectModel(args, ctx, deps) });
   registry.registerCommand("tg-voice-language", { description: "Set local STT language", handler: async (args, ctx) => setLanguage(`language ${args.trim() || "auto"}`, ctx, deps) });

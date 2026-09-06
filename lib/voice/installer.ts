@@ -20,6 +20,14 @@ export type VoiceModelInstall = {
   huggingFaceRepo?: string;
 };
 
+export function isVoiceModelInstalled(spec: VoiceModelInstall): boolean {
+  const installedPath = expandHome(spec.installedPath);
+  if (!existsSync(installedPath)) return false;
+  if (spec.targetKind === "directory" || !spec.directFiles) return true;
+  const parent = dirname(installedPath);
+  return spec.directFiles.every((file) => existsSync(join(parent, safeRelativePath(file.relativePath))));
+}
+
 type HubTreeEntry = { type?: string; path?: string; lfs?: { oid?: string } };
 
 function safeRelativePath(path: string): string {
@@ -75,7 +83,7 @@ async function hubFiles(repo: string): Promise<DirectInstallFile[]> {
  */
 export async function installVoiceModel(spec: VoiceModelInstall, onProgress: (message: string) => void): Promise<void> {
   const installedPath = expandHome(spec.installedPath);
-  if (existsSync(installedPath)) throw new Error(`already installed: ${spec.installedPath}`);
+  if (isVoiceModelInstalled(spec)) throw new Error(`already installed: ${spec.installedPath}`);
   const parent = dirname(installedPath);
   const lock = `${installedPath}.install.lock`;
   await mkdir(parent, { recursive: true, mode: 0o700 });
@@ -90,11 +98,17 @@ export async function installVoiceModel(spec: VoiceModelInstall, onProgress: (me
     await mkdir(staging, { recursive: true, mode: 0o700 });
     const files = spec.directFiles ?? await hubFiles(spec.huggingFaceRepo!);
     if (files.length === 0) throw new Error("approved model repository contains no downloadable files");
-    for (let index = 0; index < files.length; index++) {
-      const file = files[index];
+    // A manually interrupted or older install may contain only some of a
+    // multi-file model. Keep verified existing files and fetch only what is
+    // missing so the normal install command can repair it.
+    const missingFiles = spec.targetKind === "files"
+      ? files.filter((file) => !existsSync(join(parent, safeRelativePath(file.relativePath))))
+      : files;
+    for (let index = 0; index < missingFiles.length; index++) {
+      const file = missingFiles[index];
       const output = resolve(staging, safeRelativePath(file.relativePath));
       if (relative(staging, output).startsWith("..")) throw new Error("installer blocked an unsafe destination");
-      onProgress(`Downloading ${spec.label}: file ${index + 1}/${files.length}`);
+      onProgress(`Downloading ${spec.label}: file ${index + 1}/${missingFiles.length}`);
       await download(file.url, output, file.sha256);
     }
     if (spec.targetKind === "directory") {
@@ -103,7 +117,7 @@ export async function installVoiceModel(spec: VoiceModelInstall, onProgress: (me
     } else {
       // Move the configured presence marker last. A crash can at worst leave
       // supporting metadata behind; it cannot make a partial model look ready.
-      const stagedFiles = [...files].sort((a, b) => {
+      const stagedFiles = [...missingFiles].sort((a, b) => {
         const aMarker = join(parent, safeRelativePath(a.relativePath)) === installedPath ? 1 : 0;
         const bMarker = join(parent, safeRelativePath(b.relativePath)) === installedPath ? 1 : 0;
         return aMarker - bMarker;
@@ -116,7 +130,7 @@ export async function installVoiceModel(spec: VoiceModelInstall, onProgress: (me
       }
       await rm(staging, { recursive: true, force: true });
     }
-    if (!existsSync(installedPath)) throw new Error("installation finished without the expected model file");
+    if (!isVoiceModelInstalled(spec)) throw new Error("installation finished without all expected model files");
   } catch (error) {
     await rm(staging, { recursive: true, force: true });
     throw error;

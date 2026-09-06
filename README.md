@@ -464,6 +464,7 @@ All commands use the existing Telegram authorization/pairing gate:
 | `/tg-voice-install` | Interactive, explicitly confirmed download of an allow-listed local model/voice from its documented source |
 | `/tg-voice-setup` | Interactive wizard to select supported **already-installed** STT and Piper models and save configuration |
 | `/tg-voice-status` | Alias for voice diagnostics |
+| `/tg-voice-healthcheck` | Diagnose the configured local voice setup and offer one repair flow for missing runtimes or partial allow-listed model installs |
 | `/tg-voice-mode auto\|on\|off` | Set reply mode |
 | `/tg-voice-model stt small` | Select a known installed STT model |
 | `/tg-voice-model tts en_US-lessac-medium` | Select a known installed Piper voice |
